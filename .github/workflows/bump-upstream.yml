@@ -39,10 +39,12 @@ jobs:
           printf 'version.txt: %s\n' "$cur"
 
           # Newest stable release tag: canary tags and pre-releases never
-          # produce a package artifact.
+          # produce a package artifact. Single-digit major only — upstream's
+          # retired year-form tags (v2026.9.24) still sort above 0.x releases
+          # and are not current-stable.
           newest="$(gh api "repos/$UPSTREAM/releases?per_page=30" \
             | jq -r 'map(select(.draft == false and .prerelease == false))
-                     | map(select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))
+                     | map(select(.tag_name | test("^v[0-9]\\.[0-9]+\\.[0-9]+$")))
                      | sort_by(.tag_name | sub("^v"; "") | split(".") | map(tonumber))
                      | last | .tag_name')"
           [ -n "$newest" ] && [ "$newest" != "null" ] \

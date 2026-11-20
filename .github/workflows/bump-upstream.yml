@@ -1,0 +1,125 @@
+name: Bump upstream version
+
+# Watches upstream stable Hermes Agent tags. When a new one exists that the
+# version file does not yet point at, this opens a PR bumping version.txt —
+# renovate-style: one PR per pending bump, force-pushed to keep it current
+# until it is merged. Merging the PR is the go-signal: the push to main on
+# version.txt triggers hermes-desktop-releases.yml, which builds and publishes
+# the AppImage release.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2,14 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bump-upstream
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare the version file against upstream's newest stable tag
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: NousResearch/hermes-agent
+        run: |
+          set -euo pipefail
+
+          cur="$(tr -d '[:space:]' < version.txt)"
+          printf 'version.txt: %s\n' "$cur"
+
+          # Newest stable release tag: canary tags and pre-releases never
+          # produce a package artifact.
+          newest="$(gh api "repos/$UPSTREAM/releases?per_page=30" \
+            | jq -r 'map(select(.draft == false and .prerelease == false))
+                     | map(select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))
+                     | sort_by(.tag_name | sub("^v"; "") | split(".") | map(tonumber))
+                     | last | .tag_name')"
+          [ -n "$newest" ] && [ "$newest" != "null" ] \
+            || { echo "upstream published no stable release" >&2; exit 1; }
+          printf 'upstream newest: %s\n' "$newest"
+
+          if [ "$newest" = "v$cur" ]; then
+            echo "up to date"
+            exit 0
+          fi
+          printf 'next=%s\n' "$newest" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare the bump branch
+        if: steps.check.outputs.next != ''
+        id: prep
+        env:
+          NEXT: ${{ steps.check.outputs.next }}
+        run: |
+          set -euo pipefail
+
+          branch=bump/upstream
+          git config user.name "hermes-desktop-light bot"
+          git config user.email "hermes-desktop-light[bot]@users.noreply.github.com"
+
+          git fetch --quiet origin 2>/dev/null || true
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            # Rebase the existing bump branch (the PR must stay open and be
+            # force-updated rather than recreated), rebased onto current main.
+            if git ls-tree --quiet origin/"$branch" -- version.txt \
+               && [ "$(git show origin/"$branch":version.txt | tr -d '[:space:]')" = "${NEXT#v}" ]; then
+              echo "branch already at $NEXT, nothing to do"
+              printf 'noop=true\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git switch --quiet --create "$branch" "origin/$branch"
+            git reset --quiet --soft origin/main
+          else
+            printf 'noop=false\n' >> "$GITHUB_OUTPUT"
+            git switch --quiet --create "$branch" origin/main
+          fi
+
+          printf '%s\n' "${NEXT#v}" > version.txt
+          git add version.txt
+          git commit --quiet -m "chore: bump upstream to $NEXT"
+          printf 'branch=%s\nnoop=false\n' "$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Push the updated branch
+        if: steps.check.outputs.next != '' && steps.prep.outputs.noop != 'true'
+        env:
+          BRANCH: ${{ steps.prep.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease=refs/heads/bump/upstream \
+            origin "HEAD:refs/heads/bump/upstream"
+
+      - name: Open or refresh the bump PR
+        if: steps.check.outputs.next != '' && steps.prep.outputs.noop != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: NousResearch/hermes-agent
+          NEXT: ${{ steps.check.outputs.next }}
+          BRANCH: ${{ steps.prep.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          title="chore: bump upstream to $NEXT"
+          body="$(printf '%s\n' \
+            "Bumps \`version.txt\` to \`${NEXT#v}\`, the newest stable tag of [$UPSTREAM](https://github.com/$UPSTREAM)." \
+            "" \
+            "Merging this PR triggers the hermes-desktop-releases workflow, which builds the Hermes Light AppImage from \`$NEXT\` and publishes it as \`hermes-desktop-$NEXT\`. If a newer upstream tag lands before this is merged, this PR is force-updated in place — no new PR opens per tag.")"
+
+          pr="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' || true)"
+          if [ -n "$pr" ] && [ "$pr" != "null" ]; then
+            echo "refreshing PR #$pr"
+            gh pr edit "$pr" --title "$title" --body "$body"
+          else
+            echo "creating PR"
+            gh pr create --title "$title" --body "$body" --base main --head "$BRANCH"
+          fi

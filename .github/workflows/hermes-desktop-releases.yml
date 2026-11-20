@@ -1,0 +1,197 @@
+name: Hermes Desktop releases
+
+# Builds the upstream light desktop variant ("Hermes Light") from each new
+# stable Hermes Agent tag and publishes it as a hermes-desktop-v<version>
+# release in this repository. Consumers pin these releases:
+#   - the FlatPark package com.nousresearch.hermes-light, whose update
+#     resolver reads the newest hermes-desktop-v* release from here
+#
+# Upstream publishes no Linux desktop packages yet (NousResearch/hermes-agent
+# issue #98171), so this workflow is the artifact source until that changes;
+# if upstream starts publishing, point consumers there and retire this.
+#
+# Build recipe: a clean checkout at the release tag, built with upstream's
+#   python -m scripts.bundles.desktop --tag=vX.Y.Z --variant=light
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Build one specific upstream tag (vX.Y.Z) instead of catching up"
+        required: false
+        type: string
+  schedule:
+    # Twice daily, so a new upstream stable tag gets its artifact quickly.
+    - cron: "0 1,13 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hermes-desktop-releases
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Pick upstream tags that have no published artifact yet
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: NousResearch/hermes-agent
+          UPSTREAM_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Stable release tags only: canary tags (vX+canary…) and commit
+          # builds never produce a package artifact.
+          stable_filter='test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")'
+
+          if [ -n "$UPSTREAM_TAG" ]; then
+            echo "$UPSTREAM_TAG" | grep -Eq "^v[0-9]+\.[0-9]+\.[0-9]+$" \
+              || { echo "tag must look like vX.Y.Z, got: $UPSTREAM_TAG" >&2; exit 1; }
+            printf 'tags=%s\n' "$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          have="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            | jq -r '.[].tag_name' | grep '^hermes-desktop-v' || true)"
+
+          # The tags to build are the genuinely new ones: upstream stable tags
+          # newer than the newest tag already published here (in the releases
+          # API's order, so the year-form tags upstream retired sort out
+          # naturally), oldest first, at most 5 per run. Historical gaps below
+          # the newest published artifact are never built: nothing consumes
+          # them — the FlatPark resolver takes the latest build. jq binds each
+          # tag before index(): function arguments close over the current
+          # input, and the input there is the have-list.
+          tags="$(gh api "repos/$UPSTREAM/releases?per_page=30" \
+            | jq -r --arg have "$have" '
+                [.[]
+                 | select(.draft == false and .prerelease == false)
+                 | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                 | .tag_name]
+                | . as $stable
+                | ($stable | length) as $n
+                | ([range(0; $n)]
+                   | map(select(($stable[.] as $t | ($have | split("\n")) | index("hermes-desktop-" + $t)) != null))
+                   | .[0]) as $ai
+                | if $ai == null then [$stable[0]]
+                  else ([range(0; $ai)] | map($stable[.])
+                        | map(. as $t2 | select((($have | split("\n")) | index("hermes-desktop-" + $t2)) == null) | $t2)
+                        | reverse | .[0:5])
+                  end
+                | join("\n")')"
+
+          printf 'tags=%s\n' "$tags" >> "$GITHUB_OUTPUT"
+          echo "tags to build: ${tags:-none}"
+
+      - name: Build and publish each missing tag
+        if: steps.pick.outputs.tags != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: NousResearch/hermes-agent
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            version="${tag#v}"
+            rel_tag="hermes-desktop-$tag"
+
+            if gh release view "$rel_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$rel_tag already exists, skipping"
+              continue
+            fi
+
+            echo "::group::build $tag"
+            rm -rf hermes-src
+            # A clean checkout at the exact tag: the upstream build refuses a
+            # dirty tree and stamps the checkout commit into the artifact.
+            git clone --quiet --filter=blob:none "https://github.com/$UPSTREAM" hermes-src
+            git -C hermes-src checkout --quiet --detach "$tag"
+
+            # Upstream's own bundling pipeline provisions its Node toolchain
+            # itself; the runner only needs python3 and git. Two phases, so the
+            # icon-tool workaround below can land between them. Both phases run
+            # from the repo root — that is where `python -m scripts.…` resolves.
+            (
+              cd hermes-src
+              # Upstream's stable builds carry an anti-tampering claim: the
+              # build must name an annotated rc.<N>-<tag> attempt ref whose
+              # version matches the build and whose tag object carries an
+              # immutable tagger timestamp (scripts/bundles/desktop_prepare.py).
+              # The attempt that points at the release commit is the one
+              # upstream's pipeline admitted; its timestamp becomes the
+              # release epoch stamped into the artifact.
+              rel_commit="$(git rev-parse "refs/tags/$tag^{commit}")"
+              claim_tag="$(git for-each-ref --format='%(refname:short) %(*objectname)' "refs/tags/rc.*-$tag" \
+                             | awk -v c="$rel_commit" '$2 == c {print $1; exit}')"
+              [ -n "$claim_tag" ] || claim_tag="$(git for-each-ref --format='%(refname:short)' "refs/tags/rc.*-$tag" | tail -n1)"
+              [ -n "$claim_tag" ] || { echo "no rc.*-$tag attempt tag found" >&2; exit 1; }
+              export RELEASE_CLAIM_TAG="$claim_tag"
+              export RELEASE_CLAIM_OBJECT="$(git rev-parse "refs/tags/$claim_tag")"
+              echo "claim: $claim_tag -> $RELEASE_CLAIM_OBJECT"
+
+              prepared="$(python3 -m scripts.bundles.desktop \
+                            --tag="$tag" --variant=light --prepare-only \
+                            | tail -n1)"
+              echo "prepared: $prepared"
+
+              # electron-builder's icon step runs icon-tool.js, which is
+              # CommonJS, as ESM: the nearest package.json says "type":
+              # "module" (hit at v0.22.5, tracked upstream). Patch the copy in
+              # the prepare cache — the source the packager stages from.
+              while IFS= read -r tool; do
+                dir="$(dirname "$tool")"
+                [ -e "$dir/package.json" ] || {
+                  printf '{"type":"commonjs"}\n' > "$dir/package.json"
+                  echo "icon-tool commonjs shim: $dir"
+                }
+              done < <(find .cache -name icon-tool.js -print 2>/dev/null)
+
+              # The packager's prepared.json checksums its staged inputs, so a
+              # patched source makes the staged copies stale ("Missing or
+              # changed packaging input … run preparation again" — upstream's
+              # own message). Drop the staged tree and prepare again: the
+              # second pass re-stages from the patched cache and records
+              # checksums that match it.
+              rm -rf .build/desktop-job
+              prepared="$(python3 -m scripts.bundles.desktop \
+                            --tag="$tag" --variant=light --prepare-only \
+                            | tail -n1)"
+              echo "prepared (re-staged): $prepared"
+
+              python3 -m scripts.bundles.desktop --prepared "$prepared" --variant=light
+
+              appimage="$(find . -name 'HermesLight-*-linux-x86_64.AppImage' -print -quit)"
+              [ -n "$appimage" ] || { echo "no HermesLight AppImage in the build output" >&2; exit 1; }
+              appimage="$(readlink -f "$appimage")"
+              echo "appimage: $appimage"
+              printf '%s\n' "$appimage" > "$GITHUB_WORKSPACE/appimage-path"
+            )
+            appimage="$(cat "$GITHUB_WORKSPACE/appimage-path")"
+            rm -f "$GITHUB_WORKSPACE/appimage-path"
+            echo "::endgroup::"
+
+            echo "::group::publish $rel_tag"
+            ( cd "$(dirname "$appimage")" && sha256sum "$(basename "$appimage")" ) > SHA256SUMS
+            cat SHA256SUMS
+
+            {
+              printf 'Hermes Light %s (upstream light variant — remote-only desktop client, no bundled agent runtime), built from [%s at `%s`](https://github.com/%s/releases/tag/%s) by the hermes-desktop-releases workflow in this repository.\n\n' "$version" "$UPSTREAM" "$tag" "$UPSTREAM" "$tag"
+              printf -- '- `%s` — the desktop AppImage\n' "$(basename "$appimage")"
+              printf -- '- `SHA256SUMS` — its sha256, as pinned by the FlatPark package com.nousresearch.hermes-light\n\n'
+              printf "Built from a clean checkout of the tag with upstream's \`python -m scripts.bundles.desktop --tag=%s --variant=light\`; the recipe lives in this workflow.\n" "$tag"
+            } > release-notes.md
+
+            gh release create "$rel_tag" -R "$GITHUB_REPOSITORY" \
+              --title "$rel_tag" \
+              --notes-file release-notes.md
+            gh release upload "$rel_tag" -R "$GITHUB_REPOSITORY" "$appimage" SHA256SUMS --clobber
+            echo "::endgroup::"
+
+            rm -rf hermes-src SHA256SUMS release-notes.md
+          done < <(printf '%s\n' "${{ steps.pick.outputs.tags }}")
